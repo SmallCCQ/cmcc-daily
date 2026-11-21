@@ -16,3 +16,8 @@ test-results/
 dist/
 .pytest_cache/
 .DS_Store
+
+# 本地会话 profile（含设备指纹 cellNum/xk/imei，不外传）
+.cmcc_session_*.json
+# 本地临时添加账号脚本
+add_account.py

@@ -156,6 +156,15 @@ class Config:
         self.webhook_token = env.get("CMCC_WEBHOOK_TOKEN", file_cfg.get("webhook_token", ""))
         self.fee_session_cookie = env.get("CMCC_FEE_SESSION", file_cfg.get("fee_session_cookie", ""))
         self.fee_prov_code = env.get("CMCC_FEE_PROV", file_cfg.get("fee_prov_code") or self.province_code)
+        # autoLogin 现签模板（可选）：抓包后用 cmcc_session.py --print-template 导出，
+        # app_token 闲置过期时可现签新会话绕过（见 _mint_fresh_session）。
+        self.session_template = file_cfg.get("session_template") or {}
+        env_tpl = env.get("CMCC_SESSION_TEMPLATE")
+        if env_tpl:
+            try:
+                self.session_template = json.loads(env_tpl)
+            except ValueError:
+                log.warning("CMCC_SESSION_TEMPLATE 不是合法 JSON，已忽略")
 
     @property
     def act_url(self) -> str:
@@ -167,6 +176,43 @@ class Config:
         if not self.phone or not re.fullmatch(r"1\d{10}", self.phone):
             return "缺少合法手机号（CMCC_PHONE 或 config.json）"
         return None
+
+
+def _app_token_login(s: requests.Session, login_url: str, base_body: dict,
+                     token: str) -> dict:
+    """appTokenLogin：用 cookie 换活动会话。token 即 app_token 形态的 cookie 串。"""
+    try:
+        r = s.post(login_url, json={**base_body, "jwtToken": None, "token": token},
+                   timeout=30)
+        return r.json()
+    except ValueError:
+        return {}
+
+
+def _mint_fresh_session(cfg: Config) -> str | None:
+    """用 autoLogin 现签一张新会话 cookie（替代已失效的 app_token）。
+
+    优先读本地 profile（.cmcc_session_<尾号>.json）；无 profile 时用 config 里的
+    session_template。缺失或失败返回 None，由调用方决定回退。
+    """
+    try:
+        import cmcc_session
+    except ImportError:
+        log.info("未安装 cmcc_session.py，无法 autoLogin 现签")
+        return None
+    profile = None
+    try:
+        profile = cmcc_session.load_profile(cfg.phone[-4:])
+    except SystemExit:
+        pass
+    if profile is None and cfg.session_template:
+        profile = {"url": "https://client.app.coc.10086.cn" + cmcc_session.REFRESH_PATH,
+                   "cookie": "", "template": cfg.session_template,
+                   "xk": cfg.session_template.get("xk", ""), "phone": cfg.phone}
+    if not profile:
+        log.info("无会话模板（先抓包一次并用 --har 存 profile），无法自动续期")
+        return None
+    return cmcc_session.mint_cookie(profile)
 
 
 # ---------------------------------------------------------------- 会话建立
@@ -285,8 +331,13 @@ def exchange_session(cfg: Config, act_url: str | None = None) -> tuple[requests.
 
     # ③ 回落：app_token 引导登录（首次配置或 jwt 失效后）
     if resp is None:
-        r = s.post(login_url, json={**base_body, "jwtToken": None, "token": cfg.app_token}, timeout=30)
-        resp = r.json()
+        resp = _app_token_login(s, login_url, base_body, cfg.app_token)
+        if resp.get("code") != "SUCCESS":
+            # app_token 的会话闲置会被回收；autoLogin 可现签新会话绕过（见 cmcc_session.py）
+            fresh = _mint_fresh_session(cfg)
+            if fresh:
+                log.info("app_token 会话已过期，用 autoLogin 现签新会话重试")
+                resp = _app_token_login(s, login_url, base_body, fresh)
         if resp.get("code") != "SUCCESS":
             message = str(resp.get("msg") or "").lower()
             if (any(word in message for word in ("token", "jwt", "凭证", "票据", "会话", "登录", "认证"))
